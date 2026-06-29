@@ -104,7 +104,7 @@ class Target:
         # Load each task
         for task in tasks:
             task_name = task['task_name']
-            self.tasks[task_name] = task  # Store task configuration
+            self.tasks[task_name] = dict(task)  # Store task configuration
             self._load_task(task)
             
     def _load_task(self, task: Dict[str, Union[str, float, int]]) -> None:
@@ -127,7 +127,7 @@ class Target:
         file_type = task['file_type'].lower()
         
         # Store task information
-        self.task_info[task_name] = task
+        self.task_info[task_name] = dict(task)
         
         # Load data based on file type
         if file_type == 'bed':
@@ -205,9 +205,9 @@ class Target:
         # Store labels and statistics
         self.data[task_name] = labels
         self.task_info[task_name].update({
-            'positive_count': (labels > 0).sum(),
-            'negative_count': (labels == 0).sum(),
-            'positive_ratio': (labels > 0).mean()
+            'positive_count': int((labels > 0).sum()),
+            'negative_count': int((labels == 0).sum()),
+            'positive_ratio': float((labels > 0).mean()) if labels.size else float("nan")
         })
         
     def _load_from_bigwig(self, task: Dict[str, Union[str, float, int]]) -> None:
@@ -250,17 +250,30 @@ class Target:
         # Store values and statistics
         self.data[task_name] = values
         
+        if values.size:
+            value_stats = {
+                'mean': float(np.mean(values)),
+                'std': float(np.std(values)),
+                'min': float(np.min(values)),
+                'max': float(np.max(values)),
+                'median': float(np.median(values)),
+            }
+        else:
+            value_stats = {
+                'mean': float("nan"),
+                'std': float("nan"),
+                'min': float("nan"),
+                'max': float("nan"),
+                'median': float("nan"),
+            }
+
         # Calculate basic statistics
         stats = {
-            'mean': float(np.mean(values)),
-            'std': float(np.std(values)),
-            'min': float(np.min(values)),
-            'max': float(np.max(values)),
-            'median': float(np.median(values)),
             'bin_size': bin_size,
             'aggfunc': aggfunc,
             'shape': values.shape
         }
+        stats.update(value_stats)
         
         # Add binary classification stats if threshold is provided
         if threshold is not None:
@@ -269,10 +282,10 @@ class Target:
                 'threshold': threshold,
                 'positive_count': int(binary.sum()),
                 'negative_count': int((binary == 0).sum()),
-                'positive_ratio': float(binary.mean())
+                'positive_ratio': float(binary.mean()) if binary.size else float("nan")
             })
         
-        self.task_info[task_name] = stats
+        self.task_info[task_name].update(stats)
         
     def get_labels(
         self,
@@ -350,7 +363,7 @@ class Target:
         # Add task configuration info that might not be in task_info
         for task_name, task_config in self.tasks.items():
             for key, value in task_config.items():
-                if key not in task_df.columns:
+                if key not in task_df.columns or pd.isna(task_df.loc[task_name, key]):
                     task_df.loc[task_name, key] = value
         
         return task_df

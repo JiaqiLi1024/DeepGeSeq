@@ -1,31 +1,270 @@
-"""DGS Model Module.
+"""Stable model exports and support metadata for DGS.
 
-This module provides various model architectures for deep genomic sequence analysis:
-
-1. Basic Models:
-   - BasicModel: Base class for all models
-   - CNN: Basic Convolutional Neural Network
-   - CAN: Convolutional Attention Network
-
-2. Residual Models:
-   - BasicBlock: Basic residual block
-   - Bottleneck: Bottleneck residual block
-   - ResNet: Residual Network architecture
-   - ResidualNet: Factory function for creating ResNet models
-
-3. Published Models:
-   - DeepSEA: DeepSEA architecture (Zhou & Troyanskaya, 2015)
-   - Beluga: DeepSEA architecture used in Expecto (Zhou & Troyanskaya, 2019)
-   - DanQ: DanQ architecture (Quang & Xie, 2016)
-   - Basset: Basset architecture (Kelley, 2016)
-   - BPNet: BPNet architecture (Schreiber, 2018)
-   - scBasset: scBasset architecture (Yuan et al, 2022)
-
-4. Extension Utilities:
-   - Module loading and instantiation utilities
+Recommended imports are listed in ``__all__``. ``MODEL_ZOO`` records the
+workflow support level for exported architectures so docs and reviewers can
+distinguish scalar prediction models from partial profile-model components.
 """
+
+import copy
 
 from .BasicModel import *
 from .ConvModel import *
 from .Publications import *
 from .Extention import *
+from .Residual import ResidualNet
+from .Enformer import Enformer
+from .Foundation import (
+    DNABERTAdapter,
+    DNABERT2Adapter,
+    Evo2Adapter,
+    FoundationSequenceAdapter,
+    GenomicLanguageModelAdapter,
+    GLM_MODEL_PRESETS,
+    GPNAdapter,
+    NucleotideTransformerAdapter,
+    build_dnabert_adapter,
+    build_dnabert2_adapter,
+    build_evo2_adapter,
+    build_genomic_language_model_adapter,
+    build_gpn_adapter,
+    build_nucleotide_transformer_adapter,
+    build_transformers_sequence_adapter,
+)
+from .Profiles import ChromBPNet, Borzoi, KerasProfileAdapter, load_keras_profile_model
+
+MODEL_ZOO = {
+    "CNN": {
+        "class_name": "CNN",
+        "input_shape": "(batch, 4, sequence_length)",
+        "output_shape": "(batch, output_size)",
+        "task_type": "scalar classification/regression",
+        "workflow_status": "tested",
+        "tested_in": "DGS/tests/test_core_workflow_smoke.py",
+        "citation": "DGS baseline CNN",
+        "notes": "Recommended lightweight example model for file-native workflows.",
+    },
+    "CAN": {
+        "class_name": "CAN",
+        "input_shape": "(batch, 4, sequence_length)",
+        "output_shape": "(batch, output_size)",
+        "task_type": "scalar classification/regression",
+        "workflow_status": "partially tested",
+        "tested_in": "import and model-level usage only",
+        "citation": "CBAM attention block",
+        "notes": "Architecture is exported; full workflow tutorial coverage is limited.",
+    },
+    "DeepSEA": {
+        "class_name": "DeepSEA",
+        "input_shape": "(batch, 4, sequence_length)",
+        "output_shape": "(batch, n_genomic_features)",
+        "task_type": "scalar multi-label classification",
+        "workflow_status": "partially tested",
+        "tested_in": "model-level compatibility",
+        "citation": "Zhou and Troyanskaya, 2015",
+        "notes": "Use with explicit sequence_length and n_genomic_features arguments.",
+    },
+    "Beluga": {
+        "class_name": "Beluga",
+        "input_shape": "(batch, 4, 1, sequence_length)",
+        "output_shape": "(batch, n_genomic_features)",
+        "task_type": "scalar multi-label classification",
+        "workflow_status": "partially tested",
+        "tested_in": "model-level compatibility",
+        "citation": "Zhou et al., 2019",
+        "notes": "Published architecture export; not the main quick-start model.",
+    },
+    "DanQ": {
+        "class_name": "DanQ",
+        "input_shape": "(batch, 4, sequence_length)",
+        "output_shape": "(batch, n_genomic_features)",
+        "task_type": "scalar multi-label classification",
+        "workflow_status": "partially tested",
+        "tested_in": "model-level compatibility",
+        "citation": "Quang and Xie, 2016",
+        "notes": "Published architecture export; workflow coverage is limited.",
+    },
+    "Basset": {
+        "class_name": "Basset",
+        "input_shape": "(batch, 4, sequence_length)",
+        "output_shape": "(batch, n_genomic_features)",
+        "task_type": "scalar multi-label classification",
+        "workflow_status": "partially tested",
+        "tested_in": "model-level compatibility",
+        "citation": "Kelley, 2016",
+        "notes": "Published architecture export; workflow coverage is limited.",
+    },
+    "BPNet": {
+        "class_name": "BPNet",
+        "input_shape": "(batch, 4, sequence_length) plus optional control tracks",
+        "output_shape": "profile/count tuple",
+        "task_type": "profile/count prediction",
+        "workflow_status": "minimal profile workflow tested",
+        "tested_in": "DGS/tests/data/test_profile_loader.py; DGS/tests/dl/test_profile.py",
+        "citation": "Avsec et al., 2021 style BPNet family",
+        "notes": "Profile BigWig loaders, profile/count losses, metrics, and writers are tested.",
+    },
+    "ChromBPNet": {
+        "class_name": "ChromBPNet",
+        "input_shape": "(batch, sequence_length, 4) or (batch, 4, sequence_length)",
+        "output_shape": "(profile_logits, log_counts)",
+        "task_type": "bias-factorized profile/count prediction",
+        "workflow_status": "native PyTorch interface tested; official Keras checkpoint inference available through adapter",
+        "tested_in": "DGS/tests/model/test_profile_models.py",
+        "citation": "Pampari et al., ChromBPNet",
+        "notes": "Implements the documented dilated-residual ChromBPNet profile/count contract; pass a frozen bias model or use KerasProfileAdapter for official .h5 models.",
+    },
+    "Enformer": {
+        "class_name": "Enformer",
+        "input_shape": "(batch, sequence_length, 4)",
+        "output_shape": "(batch, target_length, output_tracks) or embeddings",
+        "task_type": "long-sequence regulatory track prediction",
+        "workflow_status": "model-level interface tested",
+        "tested_in": "DGS/tests/model/test_profile_models.py",
+        "citation": "Avsec et al., 2021",
+        "notes": "PyTorch Enformer-style implementation with species heads and optional embedding return.",
+    },
+    "Borzoi": {
+        "class_name": "Borzoi",
+        "input_shape": "(batch, sequence_length, 4) or (batch, 4, sequence_length)",
+        "output_shape": "(batch, output_tracks, profile_length)",
+        "task_type": "long-sequence profile prediction",
+        "workflow_status": "native PyTorch interface tested; official Keras checkpoint inference available through adapter",
+        "tested_in": "DGS/tests/model/test_profile_models.py",
+        "citation": "Linder et al., Borzoi",
+        "notes": "DGS-native Borzoi-style module follows the public conv/residual/transformer/U-Net/head contract; official .h5 weights require the external TensorFlow/Borzoi stack.",
+    },
+    "KerasProfileAdapter": {
+        "class_name": "KerasProfileAdapter",
+        "input_shape": "(batch, sequence_length, 4) or (batch, 4, sequence_length)",
+        "output_shape": "external profile/count tensors normalized to DGS conventions",
+        "task_type": "external Keras profile-model inference",
+        "workflow_status": "adapter tested",
+        "tested_in": "DGS/tests/model/test_profile_models.py",
+        "citation": "Adapter interface; user supplies model-specific citation",
+        "notes": "Lazy TensorFlow bridge for official ChromBPNet/Borzoi .h5 checkpoints; TensorFlow is optional until a checkpoint is loaded.",
+    },
+    "scBasset": {
+        "class_name": "scBasset",
+        "input_shape": "(batch, 4, sequence_length)",
+        "output_shape": "(batch, n_cells or tasks)",
+        "task_type": "single-cell accessibility prediction",
+        "workflow_status": "partially tested",
+        "tested_in": "model-level compatibility",
+        "citation": "Yuan et al., 2022",
+        "notes": "Advanced architecture export; workflow coverage is limited.",
+    },
+    "ResidualNet": {
+        "class_name": "ResidualNet",
+        "input_shape": "image-style tensor",
+        "output_shape": "(batch, num_classes)",
+        "task_type": "legacy residual-network utility",
+        "workflow_status": "legacy",
+        "tested_in": "legacy model utilities",
+        "citation": "ResNet-style utility",
+        "notes": "Kept for compatibility; not recommended for genomics quick starts.",
+    },
+    "FoundationSequenceAdapter": {
+        "class_name": "FoundationSequenceAdapter",
+        "input_shape": "DNA strings or encoder-specific tensors",
+        "output_shape": "encoder embedding or pooled embedding",
+        "task_type": "foundation-model adapter",
+        "workflow_status": "adapter tested",
+        "tested_in": "DGS/tests/model/test_foundation_adapter.py",
+        "citation": "Adapter interface; user supplies model-specific citation",
+        "notes": "Optional integration point for user-supplied genome encoders; DGS does not bundle external checkpoints.",
+    },
+    "DNABERTAdapter": {
+        "class_name": "DNABERTAdapter",
+        "input_shape": "DNA strings converted to overlapping k-mer token strings",
+        "output_shape": "pooled original DNABERT embeddings or token embeddings",
+        "task_type": "genomic language model embedding adapter",
+        "workflow_status": "adapter/factory tested; external checkpoint not bundled",
+        "tested_in": "DGS/tests/model/test_foundation_adapter.py",
+        "citation": "DNABERT; user supplies checkpoint-specific citation",
+        "notes": "Loads original k-mer DNABERT checkpoints such as `zhihan1996/DNA_bert_3` through Hugging Face Transformers; model files are external.",
+    },
+    "DNABERT2Adapter": {
+        "class_name": "DNABERT2Adapter",
+        "input_shape": "DNA strings",
+        "output_shape": "pooled DNABERT-2 embeddings or token embeddings",
+        "task_type": "genomic language model embedding adapter",
+        "workflow_status": "adapter/factory tested; external checkpoint not bundled",
+        "tested_in": "DGS/tests/model/test_foundation_adapter.py",
+        "citation": "DNABERT-2; user supplies checkpoint-specific citation",
+        "notes": "Loads `zhihan1996/DNABERT-2-117M` by default through Hugging Face Transformers with `trust_remote_code=True`; model files are external.",
+    },
+    "NucleotideTransformerAdapter": {
+        "class_name": "NucleotideTransformerAdapter",
+        "input_shape": "DNA strings",
+        "output_shape": "pooled Nucleotide Transformer embeddings or token embeddings",
+        "task_type": "genomic language model embedding adapter",
+        "workflow_status": "adapter/factory tested; external checkpoint not bundled",
+        "tested_in": "DGS/tests/model/test_foundation_adapter.py",
+        "citation": "Nucleotide Transformer; user supplies checkpoint-specific citation",
+        "notes": "Supports Hugging Face Nucleotide Transformer checkpoints such as `InstaDeepAI/nucleotide-transformer-v2-50m-multi-species`; JAX-only NT/NTv3 workflows remain external.",
+    },
+    "GPNAdapter": {
+        "class_name": "GPNAdapter",
+        "input_shape": "DNA strings",
+        "output_shape": "GPN-family logits, embeddings, or pooled tensor outputs",
+        "task_type": "genomic language model adapter",
+        "workflow_status": "adapter/factory tested; external checkpoint not bundled",
+        "tested_in": "DGS/tests/model/test_foundation_adapter.py",
+        "citation": "GPN/PhyloGPN/GPN-Star; user supplies checkpoint-specific citation",
+        "notes": "Supports documented Hugging Face GPN-family checkpoints via optional `gpn` registration modules or `trust_remote_code`; model files and model-specific packages are external.",
+    },
+    "Evo2Adapter": {
+        "class_name": "Evo2Adapter",
+        "input_shape": "DNA strings or Evo 2 token tensors",
+        "output_shape": "Evo 2 logits or selected intermediate embeddings",
+        "task_type": "autoregressive genomic language model adapter",
+        "workflow_status": "adapter interface tested; external Evo 2 runtime not bundled",
+        "tested_in": "DGS/tests/model/test_foundation_adapter.py",
+        "citation": "Evo 2; user supplies checkpoint-specific citation",
+        "notes": "Uses the optional upstream `evo2` package and its CUDA/runtime requirements; default preset is `evo2_7b`.",
+    },
+}
+
+
+def get_model_zoo():
+    """Return a copy of DGS model support metadata."""
+    return copy.deepcopy(MODEL_ZOO)
+
+
+__all__ = [
+    "BasicModel",
+    "CNN",
+    "CAN",
+    "DeepSEA",
+    "Beluga",
+    "DanQ",
+    "Basset",
+    "BPNet",
+    "ChromBPNet",
+    "Enformer",
+    "Borzoi",
+    "scBasset",
+    "ResidualNet",
+    "FoundationSequenceAdapter",
+    "GenomicLanguageModelAdapter",
+    "DNABERTAdapter",
+    "DNABERT2Adapter",
+    "NucleotideTransformerAdapter",
+    "GPNAdapter",
+    "Evo2Adapter",
+    "GLM_MODEL_PRESETS",
+    "build_transformers_sequence_adapter",
+    "build_dnabert_adapter",
+    "build_dnabert2_adapter",
+    "build_nucleotide_transformer_adapter",
+    "build_gpn_adapter",
+    "build_evo2_adapter",
+    "build_genomic_language_model_adapter",
+    "KerasProfileAdapter",
+    "load_keras_profile_model",
+    "module_from_file",
+    "module_from_dir",
+    "load_module",
+    "MODEL_ZOO",
+    "get_model_zoo",
+]

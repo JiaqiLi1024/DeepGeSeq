@@ -1,0 +1,4 @@
+interface:
+  display_name: "DGS"
+  short_description: "Natural-language workflows for DeepGeSeq"
+  default_prompt: "Use $dgs to prepare and run a DeepGeSeq workflow from my genomic data."

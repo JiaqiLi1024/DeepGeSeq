@@ -50,13 +50,22 @@ def variants_to_intervals(variants, seq_len=1000) -> Interval:
         The function automatically handles coordinate conversion
         between 1-based VCF and 0-based interval formats.
     """
+    if int(seq_len) <= 0:
+        raise ValueError(f"seq_len must be a positive integer; got {seq_len}.")
+
     intervals = []
     for _, mutation in variants.iterrows():
         chrom = mutation['CHROM']
-        pos = mutation['POS'] - 1 #VCF is 1-based
+        pos = int(mutation['POS']) - 1 #VCF is 1-based
         mid = seq_len // 2
         start = pos - mid
         end = seq_len + start
+        if start < 0:
+            raise ValueError(
+                f"Variant window for {chrom}:{mutation['POS']} extends before chromosome start "
+                f"with sequence_length={seq_len}. Use a shorter sequence_length or "
+                "filter variants too close to chromosome starts."
+            )
         intervals.append({'chrom': chrom, 'start': start, 'end': end})
     intervals = pd.DataFrame(intervals)
     intervals = Interval(intervals)
@@ -132,7 +141,15 @@ class VariantDataset(SeqDataset):
             seq_alt = DNASeq(seq_alt)
         else:
             variant = self.variants.iloc[idx]
-            raise ValueError(f"Reference sequence does not match the reference allele of the current variant at the current position: {variant}")
+            start_idx = len(seq_ref.sequence) // 2
+            observed = seq_ref.sequence[start_idx:start_idx + len(var_ref)]
+            raise ValueError(
+                "Reference allele mismatch for variant "
+                f"{variant['CHROM']}:{variant['POS']} {var_ref}>{var_alt}: "
+                f"expected REF='{var_ref}' at the center of the extracted window, "
+                f"found '{observed}'. Check that the FASTA and VCF use the same "
+                "genome assembly and chromosome naming."
+            )
 
         return seq_ref.to_onehot(), seq_alt.to_onehot()
 
@@ -185,14 +202,14 @@ def variant_effect_prediction(model, X_ref, X_alt, device=torch.device('cpu')):
     p_ref = None
     with torch.inference_mode():
         d = torch.from_numpy(X_ref.astype(np.float32)).to(device)
-        e = model(d)
+        e = _predict_with_layout_fallback(model, d)
         p_ref = e.data.cpu().numpy()
     #print(p_ref.shape)
 
     p_alt = None
     with torch.inference_mode():
         d_alt = torch.from_numpy(X_alt.astype(np.float32)).to(device)
-        e_alt = model(d_alt)
+        e_alt = _predict_with_layout_fallback(model, d_alt)
         p_alt = e_alt.data.cpu().numpy()
     #print(p_alt.shape)
 
@@ -269,6 +286,19 @@ def _to_model_input(batch: Union[np.ndarray, torch.Tensor], device: torch.device
     return batch.to(device, dtype=torch.float32)
 
 
+def _predict_with_layout_fallback(model, batch: torch.Tensor) -> torch.Tensor:
+    """Run a model, retrying NLC input as NCL for channel-first-only models."""
+    try:
+        return model(batch)
+    except RuntimeError as exc:
+        if batch.ndim == 3 and batch.shape[1] != 4 and batch.shape[-1] == 4:
+            try:
+                return model(batch.transpose(1, 2).contiguous())
+            except RuntimeError:
+                pass
+        raise exc
+
+
 def vep_centred_on_ds(model, ds,
                 metric_func='diff', mean_by_tasks=True, 
                 device=torch.device('cpu'),
@@ -333,7 +363,7 @@ def vep_centred_on_ds(model, ds,
                 seq_alt = torch.from_numpy(seq_alt)
             split_idx = seq_ref.shape[0]
             joint_input = _to_model_input(torch.cat([seq_ref, seq_alt], dim=0), device)
-            joint_output = model(joint_input).detach().cpu().numpy()
+            joint_output = _predict_with_layout_fallback(model, joint_input).detach().cpu().numpy()
             p_ref = joint_output[:split_idx]
             p_alt = joint_output[split_idx:]
             p_eff = metric_predicted_effect(p_ref, p_alt, metric_func, mean_by_tasks)
@@ -347,7 +377,9 @@ def vep_centred_on_ds(model, ds,
 def vep_centred_from_files(model, genome_filename, bcf_filename, 
                            target_len=1000, device=torch.device('cpu'), 
                            metric_func='diff', mean_by_tasks=True, 
-                           return_df=True, save_path=None):
+                           return_df=True, save_path=None,
+                           batch_size: Optional[int] = None,
+                           dataloader_config: Optional[Dict[str, Any]] = None):
     """
     Complete variant effect prediction pipeline from input files.
 
@@ -367,6 +399,10 @@ def vep_centred_from_files(model, genome_filename, bcf_filename,
         mean_by_tasks (bool): Whether to average across tasks
         return_df (bool): Whether to return DataFrame
         save_path (str, optional): Path to save results
+        batch_size (int, optional): Batch size for batched variant inference.
+            If omitted or <=1, uses the per-variant path.
+        dataloader_config (dict, optional): Optional DataLoader runtime args
+            such as `num_workers`, `pin_memory`, and `prefetch_factor`.
 
     Returns:
         Union[pd.DataFrame, Tuple[np.ndarray, pd.DataFrame]]:
@@ -381,7 +417,15 @@ def vep_centred_from_files(model, genome_filename, bcf_filename,
     from ..Data.Sequence import Genome
     ds = VariantDataset(Genome(genome_filename), variant_df, target_len=target_len)
     
-    P_diff = vep_centred_on_ds(model, ds, metric_func, mean_by_tasks, device)
+    P_diff = vep_centred_on_ds(
+        model,
+        ds,
+        metric_func,
+        mean_by_tasks,
+        device,
+        batch_size=batch_size,
+        dataloader_config=dataloader_config,
+    )
 
     if save_path:
         variant_df.to_csv(os.path.join(save_path, 'variant_df.csv'), index=False)

@@ -24,6 +24,8 @@ import torch
 from torch import nn
 from torch import optim
 
+from .Config import ConfigError, validate_config
+
 logger = logging.getLogger(__name__)
 
 # TODO: add a public HPO command entrypoint.
@@ -60,6 +62,8 @@ def preprocess_data_for_train(genome_path, target_tasks, intervals_path,
                               test_size=0.2, val_size=0.2,
                               test_chroms=["chr8"], val_chroms=["chr7"],
                               strand_aware=True, batch_size=4,
+                              loader_mode="streaming",
+                              random_state=None,
                               dataloader_config: Optional[Dict[str, Any]] = None):
     """Build train/validation/test dataloaders for supervised training.
 
@@ -74,6 +78,8 @@ def preprocess_data_for_train(genome_path, target_tasks, intervals_path,
         val_chroms (list): Validation chromosomes for chromosome split.
         strand_aware (bool): Whether reverse-complement follows strand annotations.
         batch_size (int): Dataloader batch size.
+        loader_mode (str): `"streaming"` for lazy FASTA reads or `"cached"`.
+        random_state (int, optional): Random seed for random splitting.
         dataloader_config (dict, optional): Optional dataloader runtime overrides.
 
     Returns:
@@ -85,43 +91,26 @@ def preprocess_data_for_train(genome_path, target_tasks, intervals_path,
     Notes:
         Reads genome/interval/target files and emits progress logs.
     """
-    from .Data.Sequence import Genome
-    from .Data.Target import Target
-    from .Data.Interval import Interval
-    from .Data.Dataset import GenomicDataset
-    from .Data.Dataset import create_dataloader
-    from .Data.Sampler import random_split, chromosome_split
+    from .Data.Loader import build_supervised_dataloaders
 
-    # load genome and intervals
-    genome = Genome(genome_path)
-    intervals = Interval(intervals_path)
-    logger.info("Loaded genome and intervals")
-
-    # train test split
-    if train_test_split == "random_split":
-        train_intervals, val_intervals, test_intervals = random_split(intervals, test_size=test_size, val_size=val_size)
-    elif train_test_split == "chromosome_split":
-        train_intervals, val_intervals, test_intervals = chromosome_split(intervals, test_chroms=test_chroms, val_chroms=val_chroms)
-    logger.info("Split intervals")
-    
-    # load target
-    train_target = Target(train_intervals.data, target_tasks)
-    val_target = Target(val_intervals.data, target_tasks)
-    test_target = Target(test_intervals.data, target_tasks)
-    logger.info("Loaded target")
-
-    # create dataset
-    train_ds = GenomicDataset(train_intervals, genome, train_target, strand_aware=strand_aware)
-    test_ds = GenomicDataset(test_intervals, genome, test_target, strand_aware=strand_aware)
-    val_ds = GenomicDataset(val_intervals, genome, val_target, strand_aware=strand_aware)
-    logger.info("Created dataset")
-
-    # create dataloader
     dataloader_kwargs = _get_dataloader_kwargs(dataloader_config)
-    train_loader = create_dataloader(train_ds, batch_size=batch_size, shuffle=True, **dataloader_kwargs)
-    test_loader = create_dataloader(test_ds, batch_size=batch_size, shuffle=False, **dataloader_kwargs)
-    val_loader = create_dataloader(val_ds, batch_size=batch_size, shuffle=False, **dataloader_kwargs)
-    logger.info("Created dataloader")
+    train_loader, val_loader, test_loader = build_supervised_dataloaders(
+        fasta_path=genome_path,
+        intervals_path=intervals_path,
+        target_tasks=target_tasks,
+        batch_size=batch_size,
+        mode=loader_mode,
+        split=train_test_split,
+        test_size=test_size,
+        val_size=val_size,
+        test_chroms=test_chroms,
+        val_chroms=val_chroms,
+        random_state=random_state,
+        strand_aware=strand_aware,
+        train_shuffle=True,
+        **dataloader_kwargs,
+    )
+    logger.info("Created supervised dataloaders with loader_mode=%s", loader_mode)
     
     return train_loader, val_loader, test_loader
 
@@ -382,6 +371,10 @@ def execute_dgs_explain(
     output_dir="motif_results",
     max_seqlets=2000,
     batch_size=None,
+    method="deeplift_shap",
+    baseline="zero",
+    n_steps=50,
+    internal_batch_size=None,
 ):
     """
     Generate model explanations and motif enrichment analysis.
@@ -393,18 +386,26 @@ def execute_dgs_explain(
         device (str): Device to use for computation ('cuda' or 'cpu')
         output_dir (str): Directory to save explanation results
         max_seqlets (int): Maximum number of sequence elements to analyze
-        batch_size (int, optional): Batch size for SHAP inference.
+        batch_size (int, optional): Batch size for attribution inference.
+        method (str): Attribution method for contribution scores.
+        baseline: Baseline for Captum methods. Only zero is supported.
+        n_steps (int): Number of integration steps for Integrated Gradients.
+        internal_batch_size (int, optional): Captum internal batch size for
+            Integrated Gradients.
 
     Side effects:
         Motif enrichment results are written under `output_dir`.
 
     Runtime dependencies:
-        - Underlying explain pipeline requires `tangermeme`.
+        - Legacy DeepLIFT/SHAP requires `tangermeme`.
+        - Captum DeepLift/Integrated Gradients requires `captum`.
         - Motif discovery/report steps require `modisco` CLI in PATH.
     """
     from .DL.Explain import motif_enrich
     motif_enrich(model, test_loader.dataset, target=target, device=device,
-                 output_dir=output_dir, max_seqlets=max_seqlets, batch_size=batch_size)
+                 output_dir=output_dir, max_seqlets=max_seqlets,
+                 batch_size=batch_size, method=method, baseline=baseline,
+                 n_steps=n_steps, internal_batch_size=internal_batch_size)
     logger.info("Motif enrichment completed")
 
 def preprocess_data_for_predict(genome_path, vcf_filename, target_len=1000):
@@ -640,6 +641,13 @@ class DgsCLI:
             self.config["output_dir"] = os.path.join(os.getcwd(), "output")
             self.logger.warning("No output_dir specified in config, using default output_dir: %s", self.config["output_dir"])
 
+        try:
+            validate_config(self.config, check_files=True)
+        except ConfigError:
+            raise
+        except Exception as exc:
+            raise ConfigError(f"Invalid DGS config: {exc}") from exc
+
     def _initialize_components(self):
         """
         Initialize all required components based on configuration.
@@ -691,9 +699,18 @@ class DgsCLI:
             
             self.logger.info("Initializing criterion...")
             try:
-                from torch import nn
                 criterion_config = self.config["train"]["criterion"]
-                criterion_class = getattr(nn, criterion_config["type"])
+                criterion_name = criterion_config["type"]
+                if hasattr(nn, criterion_name):
+                    criterion_class = getattr(nn, criterion_name)
+                else:
+                    from . import DL
+                    if not hasattr(DL, criterion_name):
+                        raise AttributeError(
+                            f"Unknown criterion '{criterion_name}'. "
+                            "Use torch.nn losses or exported DGS.DL losses."
+                        )
+                    criterion_class = getattr(DL, criterion_name)
                 self.criterion = criterion_class(**criterion_config.get("params", {}))
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize criterion: {e}")
@@ -768,6 +785,8 @@ class DgsCLI:
             val_chroms=self.config["data"].get("val_chroms", ["chr7"]),
             strand_aware=self.config["data"].get("strand_aware", True),
             batch_size=self.config["data"].get("batch_size", 4),
+            loader_mode=self.config["data"].get("loader_mode", "streaming"),
+            random_state=self.config["data"].get("random_state"),
             dataloader_config=dataloader_config,
         )
         self.train_loader = train_loader
@@ -874,6 +893,10 @@ class DgsCLI:
             output_dir=explain_config.get("output_dir", explain_config.get("motif_results", "motif_results")), 
             max_seqlets=explain_config.get("max_seqlets", 2000),
             batch_size=explain_config.get("batch_size"),
+            method=explain_config.get("method", "deeplift_shap"),
+            baseline=explain_config.get("baseline", "zero"),
+            n_steps=explain_config.get("n_steps", 50),
+            internal_batch_size=explain_config.get("internal_batch_size"),
         )
         self.logger.info("Explanation completed.")
     

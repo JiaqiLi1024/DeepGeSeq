@@ -14,9 +14,6 @@ from torch import nn, einsum
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint_sequential
 
-from einops import rearrange, reduce
-from einops.layers.torch import Rearrange
-
 # constants
 
 SEQUENCE_LENGTH = 128_000
@@ -36,6 +33,58 @@ def map_values(fn, d):
     """Apply `fn` to each value in dictionary `d`."""
     return {key: fn(values) for key, values in d.items()}
 
+def rearrange(tensor, pattern, **axes):
+    """Handle the small set of rearrangements used by this module.
+
+    The original implementation used ``einops``. Keeping these local tensor
+    transforms avoids making Enformer import fail in lean DGS installations.
+    """
+    if pattern == 'b d (n p) -> b d n p':
+        p = axes['p']
+        b, d, length = tensor.shape
+        if length % p != 0:
+            raise ValueError("sequence length must be divisible by p.")
+        return tensor.reshape(b, d, length // p, p)
+    if pattern == 'b n (h d) -> b h n d':
+        h = axes['h']
+        b, n, hd = tensor.shape
+        if hd % h != 0:
+            raise ValueError("last dimension must be divisible by h.")
+        return tensor.reshape(b, n, h, hd // h).permute(0, 2, 1, 3)
+    if pattern == 'n (h d) -> h n d':
+        h = axes['h']
+        n, hd = tensor.shape
+        if hd % h != 0:
+            raise ValueError("last dimension must be divisible by h.")
+        return tensor.reshape(n, h, hd // h).permute(1, 0, 2)
+    if pattern == 'b h n d -> b n (h d)':
+        b, h, n, d = tensor.shape
+        return tensor.permute(0, 2, 1, 3).contiguous().reshape(b, n, h * d)
+    if pattern == '... -> () ...':
+        return tensor.unsqueeze(0)
+    if pattern == '() ... -> ...':
+        if tensor.shape[0] != 1:
+            raise ValueError("first dimension must be singleton.")
+        return tensor.squeeze(0)
+    raise NotImplementedError(f"Unsupported rearrange pattern: {pattern}")
+
+
+class Rearrange(nn.Module):
+    """Minimal module form for the rearrangements used by Enformer."""
+
+    def __init__(self, pattern, **axes):
+        super().__init__()
+        self.pattern = pattern
+        self.axes = axes
+
+    def forward(self, tensor):
+        """Apply the configured tensor rearrangement."""
+        if self.pattern == 'b n d -> b d n':
+            return tensor.permute(0, 2, 1).contiguous()
+        if self.pattern == 'b d n -> b n d':
+            return tensor.permute(0, 2, 1).contiguous()
+        return rearrange(tensor, self.pattern, **self.axes)
+
 def exponential_linspace_int(start, end, num, divisible_by = 1):
     """Create an exponentially spaced integer sequence.
 
@@ -53,6 +102,36 @@ def exponential_linspace_int(start, end, num, divisible_by = 1):
 
     base = math.exp(math.log(end / start) / (num - 1))
     return [_round(start * base**i) for i in range(num)]
+
+def str_to_one_hot(sequences):
+    """Convert DNA strings to channel-last one-hot tensors."""
+    if isinstance(sequences, str):
+        sequences = [sequences]
+    if not sequences:
+        raise ValueError("sequences must contain at least one DNA string.")
+    seq_len = len(sequences[0])
+    if any(len(seq) != seq_len for seq in sequences):
+        raise ValueError("All sequences must have the same length.")
+
+    mapping = {"A": 0, "C": 1, "G": 2, "T": 3}
+    encoded = torch.zeros((len(sequences), seq_len, 4), dtype=torch.float32)
+    for row, sequence in enumerate(sequences):
+        for col, base in enumerate(sequence.upper()):
+            idx = mapping.get(base)
+            if idx is not None:
+                encoded[row, col, idx] = 1.0
+    return encoded
+
+def seq_indices_to_one_hot(indices):
+    """Convert integer DNA indices to channel-last one-hot tensors.
+
+    Values 0..3 map to A/C/G/T. Other values are treated as unknown bases and
+    encoded as all-zero rows.
+    """
+    mask = (indices >= 0) & (indices < 4)
+    clamped = indices.clamp(min=0, max=3)
+    one_hot = F.one_hot(clamped, num_classes=4).to(dtype=torch.float32)
+    return one_hot * mask.unsqueeze(-1).to(dtype=torch.float32)
 
 def log(t, eps = 1e-20):
     """Numerically stable logarithm with lower clamp."""

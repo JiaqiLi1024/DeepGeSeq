@@ -14,6 +14,7 @@ Key Runtime Notes:
     - Checkpoint loading supports model-only restore for evaluation workflows.
 """
 
+import inspect
 import logging
 import time
 from contextlib import nullcontext
@@ -29,6 +30,134 @@ import numpy as np
 from tqdm import tqdm
 
 logger = logging.getLogger("dgs")
+
+
+def _metrics_to_dict(metrics: "TrainerMetrics") -> Dict[str, Any]:
+    """Serialize trainer metrics into plain Python containers."""
+    return {
+        "train_losses": list(metrics.train_losses),
+        "val_losses": list(metrics.val_losses),
+        "train_metrics": list(metrics.train_metrics),
+        "val_metrics": list(metrics.val_metrics),
+        "best_val_loss": float(metrics.best_val_loss),
+        "best_val_metric": float(metrics.best_val_metric),
+        "best_epoch": int(metrics.best_epoch),
+    }
+
+
+def _move_tensors_to_cpu(value: Any) -> Any:
+    """Recursively move tensors inside checkpoint structures to CPU."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: _move_tensors_to_cpu(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_move_tensors_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_tensors_to_cpu(v) for v in value)
+    return value
+
+
+def _detach_to_cpu(value: Any) -> Any:
+    """Recursively detach tensors and move them to CPU for prediction storage."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, list):
+        return [_detach_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_to_cpu(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _detach_to_cpu(v) for k, v in value.items()}
+    return torch.as_tensor(value).detach().cpu()
+
+
+def _cat_batch_outputs(values: List[Any]) -> Any:
+    """Concatenate stored batch outputs while preserving nested structures."""
+    if not values:
+        return torch.empty(0)
+    first = values[0]
+    if isinstance(first, torch.Tensor):
+        return torch.cat(values)
+    if isinstance(first, tuple):
+        return tuple(_cat_batch_outputs([value[idx] for value in values]) for idx in range(len(first)))
+    if isinstance(first, list):
+        return [_cat_batch_outputs([value[idx] for value in values]) for idx in range(len(first))]
+    if isinstance(first, dict):
+        return {key: _cat_batch_outputs([value[key] for value in values]) for key in first}
+    return torch.cat([torch.as_tensor(value) for value in values])
+
+
+def _first_tensor(value: Any) -> torch.Tensor:
+    """Return the primary tensor from common model output/target structures."""
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return torch.empty(0)
+        return _first_tensor(value[0])
+    if isinstance(value, dict):
+        for item in value.values():
+            return _first_tensor(item)
+    return torch.as_tensor(value)
+
+
+def _metrics_from_dict(data: Optional[Dict[str, Any]]) -> "TrainerMetrics":
+    """Restore trainer metrics from a checkpoint dictionary."""
+    metrics = TrainerMetrics()
+    if not data:
+        return metrics
+    for key, value in data.items():
+        if hasattr(metrics, key):
+            setattr(metrics, key, value)
+    return metrics
+
+
+def _state_to_dict(state: "TrainerState") -> Dict[str, Any]:
+    """Serialize trainer state without requiring dataclass unpickling."""
+    return {
+        "format_version": 2,
+        "epoch": int(state.epoch),
+        "global_step": int(state.global_step),
+        "best_val_loss": float(state.best_val_loss),
+        "model_state": state.model_state,
+        "optimizer_state": state.optimizer_state,
+        "scaler_state": state.scaler_state,
+        "metrics": _metrics_to_dict(state.metrics),
+    }
+
+
+def _state_from_checkpoint(checkpoint: Any) -> "TrainerState":
+    """Convert legacy or dict checkpoints into a `TrainerState` instance."""
+    if isinstance(checkpoint, TrainerState):
+        return checkpoint
+
+    if not isinstance(checkpoint, dict):
+        raise TypeError(
+            "Unsupported checkpoint format. Expected a TrainerState or a dictionary."
+        )
+
+    if "model_state" not in checkpoint:
+        if checkpoint and all(isinstance(value, torch.Tensor) for value in checkpoint.values()):
+            return TrainerState(model_state=checkpoint)
+        raise ValueError("Checkpoint is missing required field: 'model_state'")
+
+    metrics = checkpoint.get("metrics")
+    if isinstance(metrics, TrainerMetrics):
+        restored_metrics = metrics
+    elif isinstance(metrics, dict):
+        restored_metrics = _metrics_from_dict(metrics)
+    else:
+        restored_metrics = TrainerMetrics()
+
+    return TrainerState(
+        epoch=int(checkpoint.get("epoch", 0)),
+        global_step=int(checkpoint.get("global_step", 0)),
+        best_val_loss=float(checkpoint.get("best_val_loss", restored_metrics.best_val_loss)),
+        model_state=checkpoint["model_state"],
+        optimizer_state=checkpoint.get("optimizer_state", {}),
+        scaler_state=checkpoint.get("scaler_state", {}),
+        metrics=restored_metrics,
+    )
 
 @dataclass
 class TrainerMetrics:
@@ -169,7 +298,13 @@ class Trainer:
         self.use_amp = bool(use_amp and self.device.type == "cuda")
         if use_amp and self.device.type != "cuda":
             logger.info("AMP requested but disabled because device is not CUDA")
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+            try:
+                self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+            except TypeError:
+                self.scaler = torch.amp.GradScaler(enabled=self.use_amp)
+        else:
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         logger.info(
             "Trainer runtime options: use_amp=%s, amp_dtype=%s, non_blocking=%s",
             self.use_amp,
@@ -276,25 +411,36 @@ class Trainer:
         path = Path(path or self.checkpoint_dir / f"checkpoint_{self.state.epoch}.pt")
         
         # Move model to CPU before saving
-        model_state = {
-            k: v.cpu() for k, v in self.model.state_dict().items()
-        }
+        model_state = _move_tensors_to_cpu(self.model.state_dict())
         
         # Move optimizer state to CPU
-        optimizer_state = {
-            k: v.cpu() if isinstance(v, torch.Tensor) else v
-            for k, v in self.optimizer.state_dict().items()
-        }
+        optimizer_state = _move_tensors_to_cpu(self.optimizer.state_dict())
         
         # Update state
+        self.state.best_val_loss = self.metrics.best_val_loss
         self.state.model_state = model_state
         self.state.optimizer_state = optimizer_state
-        self.state.scaler_state = self.scaler.state_dict() if self.use_amp else {}
+        self.state.scaler_state = (
+            _move_tensors_to_cpu(self.scaler.state_dict()) if self.use_amp else {}
+        )
         self.state.metrics = self.metrics
         
-        # Save checkpoint
-        torch.save(self.state, path)
+        # Save checkpoint as a plain dictionary. This is friendlier to modern
+        # PyTorch safe-loading defaults than pickling the TrainerState dataclass.
+        torch.save(_state_to_dict(self.state), path)
         logger.info(f"Saved checkpoint to {path}")
+
+    @staticmethod
+    def _torch_load_checkpoint(path: Path, device: torch.device):
+        """Load checkpoints across PyTorch versions and safe-loading defaults."""
+        load_kwargs = {"map_location": device}
+        try:
+            if "weights_only" in inspect.signature(torch.load).parameters:
+                load_kwargs["weights_only"] = False
+        except (TypeError, ValueError):
+            # Some patched torch builds may not expose an inspectable signature.
+            pass
+        return torch.load(path, **load_kwargs)
         
     def load_checkpoint(self, path: Union[str, Path], load_optimizer: bool = True) -> None:
         """Load training checkpoint.
@@ -312,25 +458,31 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint not found: {path}")
             
         try:
-            # Load checkpoint
-            checkpoint = torch.load(path, map_location=self.device)
+            # Load checkpoint. `weights_only=False` is explicit when supported
+            # because legacy DGS checkpoints stored a TrainerState dataclass.
+            checkpoint = self._torch_load_checkpoint(path, self.device)
+            checkpoint_state = _state_from_checkpoint(checkpoint)
             
             # Restore state
-            self.state = checkpoint
-            self.metrics = checkpoint.metrics
+            self.state = checkpoint_state
+            self.metrics = checkpoint_state.metrics
             
             # Restore model and optimizer
-            self.model.load_state_dict(checkpoint.model_state)
-            if load_optimizer:
-                self.optimizer.load_state_dict(checkpoint.optimizer_state)
-                if self.use_amp and getattr(checkpoint, "scaler_state", None):
-                    self.scaler.load_state_dict(checkpoint.scaler_state)
+            self.model.load_state_dict(checkpoint_state.model_state)
+            if load_optimizer and checkpoint_state.optimizer_state:
+                self.optimizer.load_state_dict(checkpoint_state.optimizer_state)
+                if self.use_amp and checkpoint_state.scaler_state:
+                    self.scaler.load_state_dict(checkpoint_state.scaler_state)
                 
                 # Ensure optimizer state is on correct device
                 for state in self.optimizer.state.values():
                     for k, v in state.items():
                         if isinstance(v, torch.Tensor):
                             state[k] = v.to(self.device)
+            elif load_optimizer:
+                logger.warning(
+                    "Checkpoint does not contain optimizer state; restored model weights only."
+                )
             
             logger.info(f"Loaded checkpoint from {path}")
             
@@ -487,8 +639,8 @@ class Trainer:
                     total_loss += loss.item()
                     success_batches += 1
                     if return_predictions:
-                        predictions.append(output.cpu())
-                        targets.append(target.cpu())
+                        predictions.append(_detach_to_cpu(output))
+                        targets.append(_detach_to_cpu(target))
                         
                 except Exception as e:
                     logger.error(f"Error in validation: {e}")
@@ -511,9 +663,9 @@ class Trainer:
         self.metrics.val_losses.append(avg_loss)
         
         if return_predictions:
-            predictions = torch.cat(predictions)
-            targets = torch.cat(targets)
-            metric = self.compute_metric(predictions, targets)
+            predictions = _cat_batch_outputs(predictions)
+            targets = _cat_batch_outputs(targets)
+            metric = self.compute_metric(_first_tensor(predictions), _first_tensor(targets))
             self.metrics.val_metrics.append(metric)
             return avg_loss, metric, predictions, targets
             
@@ -669,15 +821,15 @@ class Trainer:
                         output = self.model(data)
                     
                     # Store results
-                    predictions.append(output.cpu())
+                    predictions.append(_detach_to_cpu(output))
                     if return_probs:
-                        probabilities.append(torch.sigmoid(output).cpu())
+                        probabilities.append(torch.sigmoid(_first_tensor(output)).cpu())
                         
                 except Exception as e:
                     logger.error(f"Error in prediction: {e}")
                     continue
                     
-        predictions = torch.cat(predictions)
+        predictions = _cat_batch_outputs(predictions)
         
         if return_probs:
             probabilities = torch.cat(probabilities)

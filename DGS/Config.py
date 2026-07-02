@@ -58,6 +58,12 @@ class DataConfig:
         batch_size (int): Batch size for data loading
         strand_aware (bool): Whether to consider DNA strand information
         sequence_length (int): Length of input sequences
+        loader_mode (str): Sequence loading mode, either 'streaming' or 'cached'
+        random_state (Optional[int]): Optional seed for random data splitting
+        num_workers (int): DataLoader worker count
+        pin_memory (bool): DataLoader pinned-memory flag
+        persistent_workers (bool): Keep workers alive between epochs
+        prefetch_factor (Optional[int]): DataLoader prefetch factor for workers
     """
     # Dataset settings
     genome_path: str = ""  # Path to genome fasta file
@@ -83,6 +89,12 @@ class DataConfig:
     batch_size: int = 4
     strand_aware: bool = True
     sequence_length: int = 1000
+    loader_mode: Literal["streaming", "cached"] = "streaming"
+    random_state: Optional[int] = None
+    num_workers: int = 0
+    pin_memory: bool = False
+    persistent_workers: bool = False
+    prefetch_factor: Optional[int] = None
 
 
 @dataclass
@@ -139,6 +151,9 @@ class TrainerConfig:
         resume_model_name (str): Name of checkpoint to resume from
         use_tensorboard (bool): Whether to use TensorBoard
         tensorboard_dir (str): Directory for TensorBoard logs
+        use_amp (bool): Whether to enable CUDA automatic mixed precision
+        amp_dtype (str): AMP autocast dtype name
+        non_blocking (bool): Whether to use non-blocking device transfers
     """
 
     # Optimizer settings
@@ -175,6 +190,9 @@ class TrainerConfig:
     # Tensorboard settings
     use_tensorboard: bool = True
     tensorboard_dir: str = "tensorboard"
+    use_amp: bool = False
+    amp_dtype: str = "float16"
+    non_blocking: bool = False
     
     # # Evaluation settings
     # evaluate_training: bool = True
@@ -219,10 +237,18 @@ class ExplainConfig:
         target (int): Target task index for interpretation
         output_dir (str): Directory for saving interpretation results
         max_seqlets (int): Maximum number of sequence elements to analyze
+        method (str): Attribution method for contribution scores
+        baseline (str): Baseline strategy for Captum methods
+        n_steps (int): Number of steps for Integrated Gradients
+        internal_batch_size (Optional[int]): Captum internal batch size
     """
     target: int = 0
     output_dir: str = "motif_results"
     max_seqlets: int = 2000
+    method: str = "deeplift_shap"
+    baseline: str = "zero"
+    n_steps: int = 50
+    internal_batch_size: Optional[int] = None
 
 @dataclass
 class PredictConfig:
@@ -237,15 +263,22 @@ class PredictConfig:
         sequence_length (int): Length of sequence context around variants
         metric_func (str): Function for computing variant effects
         mean_by_tasks (bool): Whether to average predictions across tasks
+        batch_size (Optional[int]): Batch size for batched prediction; None or
+            <=1 uses the legacy per-variant path
         num_workers (int): Optional dataloader workers for batched prediction
         pin_memory (bool): Optional pinned memory for batched prediction
+        persistent_workers (bool): Keep prediction workers alive between batches
+        prefetch_factor (Optional[int]): DataLoader prefetch factor when workers are used
     """
     vcf_path: str = ""
     sequence_length: int = 1000
     metric_func: str = "diff"
     mean_by_tasks: bool = True
+    batch_size: Optional[int] = None
     num_workers: int = 0
     pin_memory: bool = False
+    persistent_workers: bool = False
+    prefetch_factor: Optional[int] = None
 
 @dataclass
 class DgsConfig:
@@ -293,6 +326,258 @@ class ConfigError(Exception):
     - Parameter values are invalid
     - Configuration file cannot be loaded
     """
+
+
+SUPPORTED_MODES = ("train", "evaluate", "explain", "predict")
+
+CONFIG_SCHEMA_REFERENCE: Dict[str, Any] = {
+    "modes": {
+        "type": "list[str]",
+        "required": False,
+        "default": ["train", "evaluate"],
+        "allowed": list(SUPPORTED_MODES),
+    },
+    "device": {
+        "type": "str",
+        "required": False,
+        "default": "cuda",
+        "allowed": ["cuda", "cpu", "cuda:<index>"],
+    },
+    "output_dir": {"type": "str", "required": False, "default": "output"},
+    "data": {
+        "required_for": ["train", "evaluate", "explain", "predict"],
+        "fields": {
+            "genome_path": {"type": "str", "required": True, "description": "Reference FASTA path."},
+            "intervals_path": {"type": "str", "required_for": ["train", "evaluate", "explain"]},
+            "target_tasks": {
+                "type": "list[dict]",
+                "required_for": ["train", "evaluate"],
+                "item_required": ["task_name", "file_path", "file_type"],
+                "file_type": ["bed", "bigwig"],
+            },
+            "loader_mode": {
+                "type": "str",
+                "required": False,
+                "default": "streaming",
+                "allowed": ["streaming", "cached"],
+            },
+            "train_test_split": {
+                "type": "str",
+                "required": False,
+                "default": "random_split",
+                "allowed": ["random_split", "chromosome_split"],
+            },
+            "batch_size": {"type": "int", "required": False, "default": 4},
+            "num_workers": {"type": "int", "required": False, "default": 0},
+            "pin_memory": {"type": "bool", "required": False, "default": False},
+            "persistent_workers": {"type": "bool", "required": False, "default": False},
+            "prefetch_factor": {"type": "int | null", "required": False, "default": None},
+        },
+    },
+    "model": {
+        "required_for": ["train", "evaluate", "explain", "predict"],
+        "fields": {
+            "type": {"type": "str", "required": True, "example": "CNN"},
+            "args": {"type": "dict", "required": False, "default": {}},
+        },
+    },
+    "train": {
+        "required_for": ["train"],
+        "fields": {
+            "optimizer": {
+                "type": "dict",
+                "required": True,
+                "fields": {"type": "str", "params": "dict"},
+            },
+            "criterion": {
+                "type": "dict",
+                "required": True,
+                "fields": {"type": "str", "params": "dict"},
+            },
+            "use_amp": {"type": "bool", "required": False, "default": False},
+            "amp_dtype": {
+                "type": "str",
+                "required": False,
+                "default": "float16",
+                "allowed": ["float16", "fp16", "bfloat16", "bf16"],
+            },
+            "non_blocking": {"type": "bool", "required": False, "default": False},
+            "resume": {"type": "bool", "required": False, "default": False},
+            "resume_model_name": {"type": "str", "required": False, "default": "best_model.pt"},
+        },
+    },
+    "evaluate": {
+        "required_for": ["evaluate"],
+        "fields": {
+            "checkpoint_path": {"type": "str | null", "required": False, "default": None},
+            "split": {"type": "str", "required": False, "default": "test"},
+        },
+    },
+    "explain": {
+        "required_for": ["explain"],
+        "fields": {
+            "target": {"type": "int", "required": False, "default": 0},
+            "method": {
+                "type": "str",
+                "required": False,
+                "default": "deeplift_shap",
+                "allowed": ["deeplift_shap", "deeplift", "integrated_gradients", "ig"],
+            },
+        },
+    },
+    "predict": {
+        "required_for": ["predict"],
+        "fields": {
+            "vcf_path": {"type": "str", "required": True},
+            "sequence_length": {"type": "int", "required": False, "default": 1000},
+            "batch_size": {"type": "int | null", "required": False, "default": None},
+        },
+    },
+}
+
+
+def get_config_schema_reference() -> Dict[str, Any]:
+    """Return a copy of the documented DGS configuration schema reference."""
+    return copy.deepcopy(CONFIG_SCHEMA_REFERENCE)
+
+
+def _as_mapping(config: Dict[str, Any], key: str) -> Dict[str, Any]:
+    """Return a nested mapping or raise a user-facing config error."""
+    value = config.get(key)
+    if not isinstance(value, dict):
+        raise ConfigError(f"Config section '{key}' must be a dictionary.")
+    return value
+
+
+def _require_value(config: Dict[str, Any], path: str) -> Any:
+    """Fetch a required dotted config path and ensure it is not empty."""
+    current: Any = config
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            raise ConfigError(f"Missing required config field: '{path}'.")
+        current = current[part]
+    if current is None or current == "":
+        raise ConfigError(f"Missing required config field: '{path}'.")
+    return current
+
+
+def _validate_existing_file(path_value: Any, path_name: str) -> None:
+    """Validate an optional file path when strict file checks are requested."""
+    path = Path(path_value)
+    if not path.exists():
+        raise ConfigError(f"Config field '{path_name}' points to a missing file: {path}")
+    if not path.is_file():
+        raise ConfigError(f"Config field '{path_name}' must point to a file: {path}")
+
+
+def _validate_component(component: Dict[str, Any], path: str) -> None:
+    """Validate optimizer or criterion component dictionaries."""
+    if not isinstance(component, dict):
+        raise ConfigError(f"Config section '{path}' must be a dictionary.")
+    if not component.get("type"):
+        raise ConfigError(f"Missing required config field: '{path}.type'.")
+    params = component.get("params", {})
+    if not isinstance(params, dict):
+        raise ConfigError(f"Config field '{path}.params' must be a dictionary.")
+
+
+def validate_config(config: Dict[str, Any], check_files: bool = False) -> None:
+    """Validate the DGS runtime config before expensive work starts.
+
+    Args:
+        config: Normalized configuration dictionary.
+        check_files: Whether referenced input files must already exist.
+
+    Raises:
+        ConfigError: If required sections, fields, values, or files are invalid.
+    """
+    if not isinstance(config, dict):
+        raise ConfigError("Config must be a dictionary.")
+
+    modes = config.get("modes", ["train", "evaluate"])
+    if not isinstance(modes, list) or not modes:
+        raise ConfigError("Config field 'modes' must be a non-empty list.")
+    unknown_modes = sorted(set(modes) - set(SUPPORTED_MODES))
+    if unknown_modes:
+        raise ConfigError(
+            f"Unsupported mode(s): {unknown_modes}. Supported modes are: {list(SUPPORTED_MODES)}."
+        )
+
+    data_cfg = _as_mapping(config, "data")
+    model_cfg = _as_mapping(config, "model")
+
+    if not model_cfg.get("type"):
+        raise ConfigError("Missing required config field: 'model.type'.")
+    if "args" in model_cfg and not isinstance(model_cfg["args"], dict):
+        raise ConfigError("Config field 'model.args' must be a dictionary if provided.")
+
+    if any(mode in modes for mode in ("train", "evaluate", "explain", "predict")):
+        genome_path = _require_value(config, "data.genome_path")
+        if check_files:
+            _validate_existing_file(genome_path, "data.genome_path")
+
+    if any(mode in modes for mode in ("train", "evaluate", "explain")):
+        intervals_path = _require_value(config, "data.intervals_path")
+        if check_files:
+            _validate_existing_file(intervals_path, "data.intervals_path")
+
+    loader_mode = data_cfg.get("loader_mode", "streaming")
+    if loader_mode not in {"streaming", "cached"}:
+        raise ConfigError("Config field 'data.loader_mode' must be 'streaming' or 'cached'.")
+
+    split = data_cfg.get("train_test_split", "random_split")
+    if split not in {"random_split", "chromosome_split"}:
+        raise ConfigError(
+            "Config field 'data.train_test_split' must be 'random_split' or 'chromosome_split'."
+        )
+
+    if any(mode in modes for mode in ("train", "evaluate")):
+        target_tasks = data_cfg.get("target_tasks")
+        if not isinstance(target_tasks, list) or not target_tasks:
+            raise ConfigError("Config field 'data.target_tasks' must be a non-empty list.")
+        for idx, task in enumerate(target_tasks):
+            if not isinstance(task, dict):
+                raise ConfigError(f"Config field 'data.target_tasks[{idx}]' must be a dictionary.")
+            missing = sorted({"task_name", "file_path", "file_type"} - set(task))
+            if missing:
+                raise ConfigError(
+                    f"Config field 'data.target_tasks[{idx}]' is missing: {missing}."
+                )
+            file_type = str(task["file_type"]).lower()
+            if file_type not in {"bed", "bigwig"}:
+                raise ConfigError(
+                    f"Config field 'data.target_tasks[{idx}].file_type' must be 'bed' or 'bigwig'."
+                )
+            if check_files:
+                _validate_existing_file(task["file_path"], f"data.target_tasks[{idx}].file_path")
+
+    if "train" in modes:
+        train_cfg = _as_mapping(config, "train")
+        _validate_component(train_cfg.get("optimizer"), "train.optimizer")
+        _validate_component(train_cfg.get("criterion"), "train.criterion")
+        if train_cfg.get("resume"):
+            checkpoint_dir = Path(train_cfg.get("checkpoint_dir", "checkpoints"))
+            resume_name = train_cfg.get("resume_model_name", "best_model.pt")
+            resume_path = checkpoint_dir / resume_name
+            if check_files and not resume_path.exists():
+                raise ConfigError(f"Training resume checkpoint not found: {resume_path}")
+
+    if "predict" in modes:
+        predict_cfg = _as_mapping(config, "predict")
+        vcf_path = _require_value(config, "predict.vcf_path")
+        if check_files:
+            _validate_existing_file(vcf_path, "predict.vcf_path")
+        sequence_length = int(predict_cfg.get("sequence_length", 1000))
+        if sequence_length <= 0:
+            raise ConfigError("Config field 'predict.sequence_length' must be a positive integer.")
+
+    if "evaluate" in modes:
+        evaluate_cfg = config.get("evaluate", {})
+        if evaluate_cfg is not None and not isinstance(evaluate_cfg, dict):
+            raise ConfigError("Config section 'evaluate' must be a dictionary.")
+        checkpoint_path = (evaluate_cfg or {}).get("checkpoint_path")
+        if check_files and checkpoint_path:
+            _validate_existing_file(checkpoint_path, "evaluate.checkpoint_path")
 
 
 def _normalize_legacy_component_params(component_cfg: Dict[str, Any], name: str) -> List[str]:
@@ -485,16 +770,24 @@ minimal_config = {
                 "file_path": "Test/recombAvg.bw",
                 "file_type": "bigwig",                
             }
-        ]
+        ],
+        "train_test_split": "random_split",
+        "batch_size": 4,
+        "loader_mode": "streaming",
+        "num_workers": 0,
+        "pin_memory": False
     },
     "train": {
         "optimizer": {
             "type": "Adam",
-            "lr": 0.001
+            "params": {"lr": 0.001}
         },
         "criterion": {
-            "type": "MSELoss"
-        }
+            "type": "MSELoss",
+            "params": {}
+        },
+        "use_amp": False,
+        "non_blocking": False
     },
     "model": {
         "type": "CNN",
@@ -502,7 +795,8 @@ minimal_config = {
     },
     "explain":{"target":0},
     "predict":{"vcf_path":"Test/test.vcf",
-              "sequence_length":1000
+              "sequence_length":1000,
+              "batch_size": None
               }
 }
 
@@ -533,7 +827,13 @@ complete_configs = {
         "test_chroms": ["chr8"],
         "val_chroms": ["chr7"],
         "strand_aware": True,
-        "batch_size": 4
+        "batch_size": 4,
+        "loader_mode": "streaming",
+        "random_state": 42,
+        "num_workers": 0,
+        "pin_memory": False,
+        "persistent_workers": False,
+        "prefetch_factor": None
     },
     
     "model": {
@@ -554,7 +854,10 @@ complete_configs = {
         "max_epochs": 500,
         "checkpoint_dir": "checkpoints",
         "use_tensorboard": False,
-        "tensorboard_dir": "tensorboard"
+        "tensorboard_dir": "tensorboard",
+        "use_amp": False,
+        "amp_dtype": "float16",
+        "non_blocking": False
     },
 
     "evaluate": {
@@ -564,7 +867,11 @@ complete_configs = {
     "explain": {
         "target": 0,
         "output_dir": "motif_results",
-        "max_seqlets": 2000
+        "max_seqlets": 2000,
+        "method": "deeplift_shap",
+        "baseline": "zero",
+        "n_steps": 50,
+        "internal_batch_size": None
     },
     
     "predict": {
@@ -572,7 +879,10 @@ complete_configs = {
         "sequence_length": 1000,
         "metric_func": "diff",
         "mean_by_tasks": True,
+        "batch_size": None,
         "num_workers": 0,
-        "pin_memory": False
+        "pin_memory": False,
+        "persistent_workers": False,
+        "prefetch_factor": None
     }
 }

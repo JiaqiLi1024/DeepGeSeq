@@ -103,6 +103,46 @@ chr2\t2500\trs4\tT\tTA\t100\tPASS\tAF=0.4\tGT
         # Check data types
         self.assertTrue(variants["POS"].dtype == np.int64)
         self.assertTrue(variants["CHROM"].dtype == object)
+
+    def test_read_vcf_accepts_standard_eight_column_records(self):
+        """Test reading VCF records without a FORMAT column."""
+        vcf_file = self.output_dir / "eight_col.vcf"
+        with open(vcf_file, "w") as f:
+            f.write("""##fileformat=VCFv4.2
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+chr1	1000	rs1	A	T	100	PASS	AF=0.1
+""")
+
+        variants = read_vcf(vcf_file)
+
+        self.assertEqual(len(variants), 1)
+        self.assertIn("FORMAT", variants.columns)
+        self.assertEqual(variants.loc[0, "FORMAT"], "")
+        self.assertEqual(int(variants.loc[0, "POS"]), 1000)
+
+    def test_read_vcf_reports_malformed_pos(self):
+        """Test VCF POS validation uses user-facing errors."""
+        vcf_file = self.output_dir / "bad_pos.vcf"
+        with open(vcf_file, "w") as f:
+            f.write("""##fileformat=VCFv4.2
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+chr1	abc	rs1	A	T	100	PASS	AF=0.1
+""")
+
+        with self.assertRaisesRegex(ValueError, "POS must be a positive integer"):
+            read_vcf(vcf_file)
+
+    def test_read_vcf_reports_incompatible_alt(self):
+        """Test symbolic or structural ALT alleles get actionable errors."""
+        vcf_file = self.output_dir / "symbolic_alt.vcf"
+        with open(vcf_file, "w") as f:
+            f.write("""##fileformat=VCFv4.2
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+chr1	1000	rs1	A	<DEL>	100	PASS	SVTYPE=DEL
+""")
+
+        with self.assertRaisesRegex(ValueError, "simple DNA alleles"):
+            read_vcf(vcf_file)
         
     def test_variants_to_intervals(self):
         """Test variant to interval conversion"""
@@ -118,6 +158,19 @@ chr2\t2500\trs4\tT\tTA\t100\tPASS\tAF=0.4\tGT
                 for start, end in zip(intervals.data["start"], intervals.data["end"])
             )
         )
+
+    def test_variants_to_intervals_reports_near_start_window(self):
+        """Test variant windows that would start before zero are rejected early."""
+        variants = pd.DataFrame({
+            "CHROM": ["chr1"],
+            "POS": [10],
+            "ID": ["rs_near_start"],
+            "REF": ["A"],
+            "ALT": ["T"],
+        })
+
+        with self.assertRaisesRegex(ValueError, "extends before chromosome start"):
+            variants_to_intervals(variants, seq_len=100)
         
     def test_mutate(self):
         """Test sequence mutation"""
@@ -206,7 +259,9 @@ chr2\t2500\trs4\tT\tTA\t100\tPASS\tAF=0.4\tGT
                 self.vcf_file,
                 target_len=100,
                 metric_func='diff',
-                return_df=True
+                return_df=True,
+                batch_size=2,
+                dataloader_config={"num_workers": 0, "pin_memory": False},
             )
             
             # Check result properties

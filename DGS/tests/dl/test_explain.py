@@ -1,6 +1,7 @@
 """Unit tests for test explain."""
 
 import unittest
+from unittest import mock
 import numpy as np
 import torch
 import tempfile
@@ -8,11 +9,31 @@ from pathlib import Path
 import os
 import shutil
 import importlib.util
+import sys
 
-from DGS.DL.Explain import motif_enrich, Seqlet_Calling
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from DGS.DL import Explain as explain_module
+from DGS.DL.Explain import (
+    calculate_attributions,
+    motif_enrich,
+    save_attribution_artifacts,
+    Seqlet_Calling,
+)
 
 HAS_TANGERMEME = importlib.util.find_spec("tangermeme") is not None
+HAS_CAPTUM = importlib.util.find_spec("captum") is not None
 HAS_MODISCO = shutil.which("modisco") is not None
+
+
+class LinearContributionModel(torch.nn.Module):
+    """Deterministic model for attribution tests."""
+    def forward(self, x):
+        """Return per-task sums over fixed channels."""
+        task0 = x[:, 0, :].sum(dim=1)
+        task1 = (2.0 * x[:, 1, :]).sum(dim=1)
+        return torch.stack([task0, task1], dim=1)
+
 
 class SimpleModel(torch.nn.Module):
     """SimpleModel implementation."""
@@ -50,7 +71,7 @@ class TestExplain(unittest.TestCase):
         self.model = SimpleModel()
         
         # Create temporary directory
-        self.temp_dir = "." #tempfile.mkdtemp()
+        self.temp_dir = tempfile.mkdtemp()
         self.output_dir = Path(self.temp_dir)
         
         # Create a simple MEME format motif database for testing
@@ -76,6 +97,88 @@ letter-probability matrix: alength= 4 w= 8
 0.1  0.05 0.8  0.05
 0.05 0.1  0.05 0.8
 """)
+
+    @unittest.skipUnless(HAS_CAPTUM, "Captum attribution tests require captum")
+    def test_captum_deeplift_attributions(self):
+        """Test Captum DeepLift attribution output."""
+        model = LinearContributionModel()
+        X = torch.zeros((2, 4, 6), dtype=torch.float32)
+        X[:, 0, :] = 1.0
+
+        attributions = calculate_attributions(
+            model,
+            X,
+            target=0,
+            device=torch.device("cpu"),
+            method="deeplift",
+        )
+
+        self.assertEqual(attributions.shape, (2, 4, 6))
+        self.assertGreater(float(np.abs(attributions).sum()), 0.0)
+        np.testing.assert_allclose(attributions[:, 0, :], 1.0, atol=1e-5)
+
+    @unittest.skipUnless(HAS_CAPTUM, "Captum attribution tests require captum")
+    def test_captum_integrated_gradients_attributions(self):
+        """Test Captum Integrated Gradients attribution output."""
+        model = LinearContributionModel()
+        X = torch.zeros((2, 4, 6), dtype=torch.float32)
+        X[:, 0, :] = 1.0
+
+        attributions = calculate_attributions(
+            model,
+            X,
+            target=0,
+            device=torch.device("cpu"),
+            method="integrated_gradients",
+            n_steps=8,
+        )
+
+        self.assertEqual(attributions.shape, (2, 4, 6))
+        self.assertGreater(float(np.abs(attributions).sum()), 0.0)
+        np.testing.assert_allclose(attributions[:, 0, :], 1.0, atol=1e-5)
+
+    def test_captum_dependency_error(self):
+        """Test missing Captum dependency message for Captum methods."""
+        with mock.patch.object(explain_module, "_CAPTUM_IMPORT_ERROR", ImportError("missing captum")):
+            with self.assertRaisesRegex(RuntimeError, "captum"):
+                calculate_attributions(
+                    LinearContributionModel(),
+                    torch.zeros((1, 4, 6), dtype=torch.float32),
+                    target=0,
+                    device=torch.device("cpu"),
+                    method="deeplift",
+                )
+
+    def test_save_attribution_artifacts_npz_uses_ncl_convention(self):
+        """Test attribution artifacts are saved with (N, 4, L) arrays."""
+        sequences = np.zeros((2, 6, 4), dtype=np.float32)
+        attributions = np.ones((2, 6, 4), dtype=np.float32)
+        output_path = self.output_dir / "attributions.npz"
+
+        saved_path = save_attribution_artifacts(
+            output_path,
+            sequences,
+            attributions,
+            method="ig",
+            target=1,
+        )
+
+        self.assertEqual(saved_path, str(output_path))
+        data = np.load(output_path)
+        self.assertEqual(data["sequences"].shape, (2, 4, 6))
+        self.assertEqual(data["attributions"].shape, (2, 4, 6))
+        self.assertEqual(str(data["method"]), "integrated_gradients")
+        self.assertEqual(str(data["shape_convention"]), "NCL")
+        self.assertEqual(int(data["target"]), 1)
+
+    def test_save_attribution_artifacts_rejects_shape_mismatch(self):
+        """Test artifact saving validates sequence and attribution shapes."""
+        with self.assertRaisesRegex(ValueError, "same shape"):
+            save_attribution_artifacts(
+                self.output_dir / "bad.npz",
+                np.zeros((2, 4, 6), dtype=np.float32),
+                np.zeros((3, 4, 6), dtype=np.float32),
+            )
 
     @unittest.skipUnless(
         HAS_TANGERMEME and HAS_MODISCO,
@@ -156,7 +259,7 @@ letter-probability matrix: alength= 4 w= 8
 
     def tearDown(self):
         """Clean up temporary files"""
-        #shutil.rmtree(self.temp_dir)
+        shutil.rmtree(self.temp_dir)
 
 if __name__ == '__main__':
     unittest.main() 

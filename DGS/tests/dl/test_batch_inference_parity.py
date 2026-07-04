@@ -2,6 +2,7 @@
 
 import unittest
 from unittest import mock
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -13,11 +14,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from DGS.DL import Predict as predict_module
 from DGS.DL import Explain as explain_module
 
+HAS_CAPTUM = importlib.util.find_spec("captum") is not None
+
 
 class _ToyModel(torch.nn.Module):
     """Helper class used by local tests."""
     def forward(self, x):
         """Compute forward outputs for `_ToyModel`."""
+        task1 = x[:, 0, :].sum(dim=1)
+        task2 = x[:, 1, :].sum(dim=1)
+        return torch.stack([task1, task2], dim=1)
+
+
+class _ChannelFirstToyModel(torch.nn.Module):
+    """Helper model that only accepts channel-first inputs."""
+    def forward(self, x):
+        """Compute outputs and reject channel-last sequence tensors."""
+        if x.ndim != 3 or x.shape[1] != 4:
+            raise RuntimeError("expected channel-first NCL input")
         task1 = x[:, 0, :].sum(dim=1)
         task2 = x[:, 1, :].sum(dim=1)
         return torch.stack([task1, task2], dim=1)
@@ -101,6 +115,30 @@ class TestBatchInferenceParity(unittest.TestCase):
         np.testing.assert_allclose(legacy, batched)
         np.testing.assert_allclose(legacy, batched_with_loader_cfg)
 
+    def test_predict_layout_fallback_supports_channel_first_models(self):
+        """Test VEP paths can retry channel-last batches as channel-first."""
+        model = _ChannelFirstToyModel()
+        dataset = _VariantPairDataset()
+
+        legacy = predict_module.vep_centred_on_ds(
+            model,
+            dataset,
+            metric_func="diff",
+            mean_by_tasks=True,
+            device=torch.device("cpu"),
+            batch_size=None,
+        )
+        batched = predict_module.vep_centred_on_ds(
+            model,
+            dataset,
+            metric_func="diff",
+            mean_by_tasks=True,
+            device=torch.device("cpu"),
+            batch_size=2,
+        )
+
+        np.testing.assert_allclose(legacy, batched)
+
     def test_explain_batch_path_matches_legacy(self):
         """Test explain batch path matches legacy."""
         dataset = _SeqDataset()
@@ -125,6 +163,35 @@ class TestBatchInferenceParity(unittest.TestCase):
 
         np.testing.assert_allclose(legacy_x, batched_x)
         np.testing.assert_allclose(legacy_attr, batched_attr)
+
+    @unittest.skipUnless(HAS_CAPTUM, "Captum attribution tests require captum")
+    def test_captum_explain_batch_path_matches_legacy(self):
+        """Test Captum attribution batch path matches sample-wise path."""
+        dataset = _SeqDataset()
+        model = _ToyModel()
+
+        for method in ["deeplift", "integrated_gradients"]:
+            legacy_x, legacy_attr = explain_module.calculate_attributions_on_ds(
+                model,
+                dataset,
+                target=0,
+                device=torch.device("cpu"),
+                batch_size=None,
+                method=method,
+                n_steps=8,
+            )
+            batched_x, batched_attr = explain_module.calculate_attributions_on_ds(
+                model,
+                dataset,
+                target=0,
+                device=torch.device("cpu"),
+                batch_size=2,
+                method=method,
+                n_steps=8,
+            )
+
+            np.testing.assert_allclose(legacy_x, batched_x)
+            np.testing.assert_allclose(legacy_attr, batched_attr, atol=1e-5)
 
 
 if __name__ == "__main__":

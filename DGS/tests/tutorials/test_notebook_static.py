@@ -14,7 +14,15 @@ from pathlib import Path
 import pytest
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+def _find_repo_root(start: Path) -> Path:
+    """Find the repository root from either nested or top-level test layouts."""
+    for candidate in (start.resolve(), *start.resolve().parents):
+        if (candidate / "DGS").exists() and (candidate / "Tutorials").exists():
+            return candidate
+    raise RuntimeError(f"Could not find repository root from {start}")
+
+
+REPO_ROOT = _find_repo_root(Path(__file__))
 TUTORIAL_ROOT = REPO_ROOT / "Tutorials"
 NOTEBOOK_RUNTIME_PACKAGES = ("nbformat", "nbclient", "ipykernel")
 
@@ -64,9 +72,16 @@ TUTORIAL_EXECUTION_REQUIREMENTS = {
         "packages": ["statsmodels"],
         "commands": [],
     },
+    "3_DGS_seqAnalysis_sciATAC/1_DGS_reproduce_published_models(Basset)_on_Dataset(sci-ATAC1).ipynb": {
+        "files": [
+            "../Dataset/Dataset.sciATAC1_train_test.h5",
+        ],
+        "packages": ["tangermeme"],
+        "commands": ["modisco"],
+    },
     "3_DGS_seqAnalysis_sciATAC/2_DGS_reproduce_published_models(DeepSEA)_on_Dataset(sci-ATAC1).ipynb": {
         "files": [
-            "Dataset.sciATAC1_train_test.h5",
+            "../Dataset/Dataset.sciATAC1_train_test.h5",
         ],
         "packages": ["tangermeme"],
         "commands": ["modisco"],

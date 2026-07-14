@@ -340,7 +340,7 @@ class Basset(nn.Module):
     - Input shape: (batch_size, 4, sequence_length)
     - Output shape: (batch_size, n_genomic_features)
     - Uses batch normalization for better training
-    - Incorporates residual connections
+    - Infers the dense input width from `sequence_length`
 
     References:
     .. [1] Kelley, D. R., et al. (2016). Basset: learning the regulatory code 
@@ -355,25 +355,40 @@ class Basset(nn.Module):
             n_genomic_features: Number of predicted output tasks.
         """
         super(Basset, self).__init__()
+        self.sequence_length = int(sequence_length)
+        self.n_genomic_features = int(n_genomic_features)
+
+        conv_filter_sizes = (19, 11, 7)
+        pool_widths = (3, 4, 4)
+        conv_filters = (300, 200, 200)
+        feature_length = self.sequence_length
+        for kernel_size, pool_width in zip(conv_filter_sizes, pool_widths):
+            feature_length = self._conv_pool_output_length(
+                feature_length,
+                kernel_size=kernel_size,
+                pool_width=pool_width,
+            )
+        self._n_channels = feature_length
+        self.flatten_dim = conv_filters[-1] * feature_length
 
         self.model = nn.Sequential(
             nn.Sequential(
                 nn.Conv2d(4,300,(1, 19)),
                 nn.BatchNorm2d(300),
                 nn.ReLU(),
-                nn.MaxPool2d((1, 8),(1, 8)),
+                nn.MaxPool2d((1, 3),(1, 3)),
                 nn.Conv2d(300,200,(1, 11)),
                 nn.BatchNorm2d(200),
                 nn.ReLU(),
-                nn.MaxPool2d((1, 8),(1, 8)),
+                nn.MaxPool2d((1, 4),(1, 4)),
                 nn.Conv2d(200,200,(1, 7)),
                 nn.BatchNorm2d(200),
                 nn.ReLU(),
-                nn.MaxPool2d((1, 8),(1, 8)),
+                nn.MaxPool2d((1, 4),(1, 4)),
             ),
             nn.Sequential(
                 Lambda(lambda x: x.view(x.size(0),-1)),
-                nn.Sequential(Lambda(lambda x: x.view(1,-1) if 1==len(x.size()) else x ),nn.Linear(4800, 1000)),
+                nn.Sequential(Lambda(lambda x: x.view(1,-1) if 1==len(x.size()) else x ),nn.Linear(self.flatten_dim, 1000)),
                 nn.BatchNorm1d(1000),
                 nn.Dropout(0.3),
                 nn.ReLU(),
@@ -390,6 +405,23 @@ class Basset(nn.Module):
         """Run forward pass for one-hot input sequences."""
         x = x.unsqueeze(2) # update 2D sequences
         return self.model(x)
+
+    @staticmethod
+    def _conv_pool_output_length(length, kernel_size, pool_width):
+        """Return 1D length after valid convolution followed by max pooling."""
+        length = int(length) - int(kernel_size) + 1
+        if length <= 0:
+            raise ValueError(
+                "Basset sequence_length is too short for convolution kernel "
+                f"{kernel_size}."
+            )
+        length = (length - int(pool_width)) // int(pool_width) + 1
+        if length <= 0:
+            raise ValueError(
+                "Basset sequence_length is too short after max pooling width "
+                f"{pool_width}."
+            )
+        return length
     
     def architecture(self):
         """Get the model's architecture parameters.
@@ -411,6 +443,7 @@ class Basset(nn.Module):
             'hidden_units2':32,
             'hidden_dropouts1':0.3,
             'hidden_dropouts2':0.3,
+            'flatten_dim': self.flatten_dim,
             'learning_rate':0.002,
             'weight_norm':7,
             'momentum':0.98}

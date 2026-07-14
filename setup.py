@@ -39,13 +39,22 @@ INSTALL_REQUIRES = [
 ]
 
 EXTRAS_REQUIRE = {
-    "explain": ["tangermeme"],
+    "explain": ["captum", "tangermeme"],
+    "notebook": ["nbformat", "nbclient", "ipykernel"],
     "tune": ["ray[tune]>=1.12.0"],
     "llm": ["transformers>=4.0.0", "einops>=0.6.0"],
+    "dev": ["pytest"],
 }
 EXTRAS_REQUIRE["all"] = sorted(
     {dep for deps in EXTRAS_REQUIRE.values() for dep in deps}
 )
+
+SKILL_DATA_FILES = [
+    ("share/dgs/dgs-skill", ["dgs-skill/SKILL.md"]),
+    ("share/dgs/dgs-skill/agents", ["dgs-skill/agents/openai.yaml"]),
+    ("share/dgs/dgs-skill/references", ["dgs-skill/references/dgs-api.md"]),
+    ("share/dgs/dgs-skill/scripts", ["dgs-skill/scripts/dgs_helper.py"]),
+]
 
 setup(
     name="dgs",
@@ -53,7 +62,7 @@ setup(
     description="DeepGeSeq is a deep learning package for genomic sequence analysis.",
     long_description=read_text(README_FILE),
     long_description_content_type="text/markdown",
-    url="https://github.com/JiaqiLiZju/DeepGeSeq",
+    url="https://github.com/JiaqiLi1024/DeepGeSeq",
     author=read_meta("author"),
     author_email=read_meta("email"),
     maintainer="jiaqili@zju.edu.cn",
@@ -64,6 +73,7 @@ setup(
     extras_require=EXTRAS_REQUIRE,
     packages=find_packages(),
     include_package_data=True,
+    data_files=SKILL_DATA_FILES,
     entry_points={
         "console_scripts": [
             "dgs=DGS.Main:main",

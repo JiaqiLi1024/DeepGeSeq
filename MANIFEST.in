@@ -1,7 +1,9 @@
 include LICENSE
 include MANIFEST.in
 include *.md
+graft dgs-skill
 graft docs
 graft Tests
 global-exclude __pycache__
 global-exclude *.py[co]
+global-exclude .DS_Store
